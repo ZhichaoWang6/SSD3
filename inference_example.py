@@ -25,8 +25,9 @@ import torch.nn.functional as F
 from transformers import AutoProcessor
 
 from kangaroo_model import KangarooQwenModel
-from inference_kangaroo import kangaroo_speculative_generate, autoregressive_generate_direct
+from inference_kangaroo import kangaroo_speculative_generate, autoregressive_generate_direct, speculative_generate_for_streaming, ar_generate_for_streaming
 from qwen_vl_utils import process_vision_info
+import copy
 
 
 def build_inputs_from_conversation(processor, conversation, device):
@@ -78,6 +79,193 @@ def warmup_model(model, processor, conversation, args, device):
 
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     print("  Warmup done.\n")
+
+
+def _build_streaming_inputs(processor, history, device):
+    """Build inputs for streaming mode: full text + all accumulated images."""
+    text = processor.apply_chat_template(
+        history, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(history)
+    inputs = processor(
+        text=[text],
+        images=image_inputs if image_inputs else None,
+        videos=video_inputs if video_inputs else None,
+        padding=True,
+        return_tensors="pt",
+    )
+    return inputs.to(device)
+
+
+def run_one_sample_streaming(model, processor, conversation, args, device, sample_idx=0):
+    """
+    流式模式：逐轮处理对话，每个 user turn 独立生成一次回复，KV cache 跨轮复用。
+    更贴近 inference.py 中 ProactiveInferenceClient 的真实推理场景。
+    """
+    block_verify = (args.verify_mode == 'fast_length')
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+
+    print(f"\n{'='*70}")
+    print(f"Sample {sample_idx}  [流式模式]")
+    print(f"{'='*70}")
+
+    # 解析对话：提取所有轮次
+    turns = []   # list of (user_turn, reference_asst_turn_or_None)
+    i = 0
+    while i < len(conversation):
+        turn = conversation[i]
+        if turn['role'] == 'system':
+            i += 1
+            continue
+        if turn['role'] == 'user':
+            ref = None
+            if i + 1 < len(conversation) and conversation[i + 1]['role'] == 'assistant':
+                ref = conversation[i + 1]
+                i += 2
+            else:
+                i += 1
+            turns.append((turn, ref))
+        else:
+            i += 1
+
+    if not turns:
+        print("  没有找到 user turn，跳过。")
+        return {}
+
+    # 初始化状态
+    history = []
+    if conversation[0]['role'] == 'system':
+        history.append(conversation[0])
+
+    spec_past_kv = None
+    ar_past_kv   = None
+
+    # 重置模型状态
+    def reset():
+        model.base_model.past_key_values = None
+        model.reset_status()
+        if hasattr(model.base_model.model, 'rope_deltas'):
+            model.base_model.model.rope_deltas = None
+
+    # Warmup（用第一个 user turn）
+    print(f"  Warmup...")
+    history_warmup = list(history) + [turns[0][0]]
+    warmup_inputs = _build_streaming_inputs(processor, history_warmup, device)
+    reset()
+    autoregressive_generate_direct(model=model, inputs=warmup_inputs, processor=processor, max_new_tokens=4)
+    reset()
+    kangaroo_speculative_generate(model=model, inputs=warmup_inputs, processor=processor,
+                                  max_new_tokens=4, early_exit_layer=args.exit_layer,
+                                  speculative_steps=args.speculative_steps,
+                                  threshold=args.threshold, block_verify=block_verify)
+    reset()
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    print(f"  Warmup done.\n")
+
+    all_spec_stats = []
+    all_ar_stats   = []
+    all_matches    = []
+
+    for turn_idx, (user_turn, ref_turn) in enumerate(turns):
+        history.append(user_turn)
+        inputs = _build_streaming_inputs(processor, history, device)
+
+        # 打印当前轮摘要
+        content = user_turn['content']
+        if isinstance(content, list):
+            texts  = [c['text'] for c in content if c.get('type') == 'text']
+            imgs   = [c for c in content if c.get('type') == 'image']
+            vids   = [c for c in content if c.get('type') == 'video']
+            media  = (f"  ({len(imgs)} img)" if imgs else "") + (f"  ({len(vids)} vid)" if vids else "")
+            text_s = ' '.join(texts)
+        else:
+            text_s, media = str(content), ""
+        ref_text = ""
+        if ref_turn:
+            rc = ref_turn['content']
+            ref_text = rc if isinstance(rc, str) else ' '.join(b['text'] for b in rc if b.get('type') == 'text')
+
+        print(f"{'─'*70}")
+        print(f"【Turn {turn_idx+1}/{len(turns)}】  input tokens={inputs['input_ids'].shape[1]}")
+        print(f"  [user] {text_s}{media}")
+        if ref_text:
+            print(f"  [ref ] {ref_text}")
+
+        # ---- Speculative ----
+        spec_reply, spec_past_kv, spec_stats = speculative_generate_for_streaming(
+            model=model,
+            inputs=inputs,
+            processor=processor,
+            past_key_values=spec_past_kv,
+            max_new_tokens=args.max_new_tokens,
+            early_exit_layer=args.exit_layer,
+            speculative_steps=args.speculative_steps,
+            threshold=args.threshold,
+            block_verify=block_verify,
+        )
+        # 将 spec 的 KV cache 同步到 base_model（speculative_generate_for_streaming 已更新）
+        spec_past_kv = model.base_model.past_key_values
+
+        # ---- AR baseline ----
+        model.base_model.past_key_values = ar_past_kv
+        model.reset_status()
+        ar_reply, ar_past_kv_new, ar_stats = ar_generate_for_streaming(
+            model=model,
+            inputs=inputs,
+            processor=processor,
+            past_key_values=ar_past_kv,
+            max_new_tokens=args.max_new_tokens,
+        )
+        ar_past_kv = ar_past_kv_new
+
+        # 恢复 base_model 的 spec KV cache（下一轮 spec 需要）
+        model.base_model.past_key_values = spec_past_kv
+        model.reset_status()
+
+        match = (spec_reply == ar_reply)
+        all_matches.append(match)
+        all_spec_stats.append(spec_stats)
+        all_ar_stats.append(ar_stats)
+
+        speedup_total  = ar_stats['total_time']  / spec_stats['total_time']  if spec_stats['total_time']  > 0 else 0
+        speedup_decode = ar_stats['decode_time'] / spec_stats['decode_time'] if spec_stats['decode_time'] > 0 else 0
+
+        print(f"  [Spec] {spec_reply}")
+        print(f"  [AR  ] {ar_reply}")
+        print(f"  {'✓ MATCH' if match else '❌ MISMATCH'}  "
+              f"accept_len={spec_stats['avg_accept_length']:.2f}  "
+              f"speedup(total)={speedup_total:.2f}x  speedup(decode)={speedup_decode:.2f}x  "
+              f"spec={spec_stats['total_time']*1000:.0f}ms  ar={ar_stats['total_time']*1000:.0f}ms")
+
+        # 把 spec 的回复加入 history（用于下一轮 context）
+        history.append({'role': 'assistant', 'content': spec_reply})
+
+    # ---- 汇总 ----
+    print(f"\n{'='*70}")
+    print(f"流式汇总  ({len(turns)} turns)")
+    print(f"{'='*70}")
+    match_rate  = sum(all_matches) / len(all_matches)
+    avg_accept  = sum(s['avg_accept_length'] for s in all_spec_stats) / len(all_spec_stats)
+    total_spec  = sum(s['total_time'] for s in all_spec_stats)
+    total_ar    = sum(s['total_time'] for s in all_ar_stats)
+    total_spec_decode = sum(s.get('decode_time', 0) for s in all_spec_stats)
+    total_ar_decode   = sum(s.get('decode_time', 0) for s in all_ar_stats)
+    overall_speedup        = total_ar / total_spec if total_spec > 0 else 0
+    overall_decode_speedup = total_ar_decode / total_spec_decode if total_spec_decode > 0 else 0
+    print(f"  Output match rate:        {match_rate:.0%}  ({sum(all_matches)}/{len(all_matches)})")
+    print(f"  Avg accept length:        {avg_accept:.2f}")
+    print(f"  Overall speedup (total):  {overall_speedup:.2f}x")
+    print(f"  Overall speedup (decode): {overall_decode_speedup:.2f}x")
+    print(f"  Total spec time:          {total_spec:.3f}s")
+    print(f"  Total AR   time:          {total_ar:.3f}s")
+
+    return {
+        'sample_idx': sample_idx,
+        'match_rate': match_rate,
+        'avg_accept_length': avg_accept,
+        'overall_speedup': overall_speedup,
+        'overall_decode_speedup': overall_decode_speedup,
+    }
 
 
 @torch.no_grad()
@@ -381,6 +569,8 @@ def main():
 
     parser.add_argument('--eval_adapter', default=False, action='store_true',
                         help='在 inference 前评估 adapter 模仿完整大模型的能力（需要 reference answer）')
+    parser.add_argument('--streaming', default=False, action='store_true',
+                        help='流式模式：逐轮处理对话，KV cache 跨轮复用，贴近真实推理场景')
     parser.add_argument('--verify_mode', type=str, default='strict', choices=['strict', 'fast_length'],
                         help='strict: lossless sequential verify; fast_length: block verify for faster approximate decoding with length match metric')
     parser.add_argument('--sample_idx', type=int, default=1,
@@ -417,7 +607,10 @@ def main():
         all_results = []
         for idx, sample in zip(indices, samples):
             conversation = sample['conversation']
-            result = run_one_sample(model, processor, conversation, args, device, idx)
+            if args.streaming:
+                result = run_one_sample_streaming(model, processor, conversation, args, device, idx)
+            else:
+                result = run_one_sample(model, processor, conversation, args, device, idx)
             all_results.append(result)
 
         # Summary across all samples
