@@ -148,9 +148,10 @@ def evaluate_adapter_quality(model, processor, conversation, reference_answer, a
     # Adapter 用 early hidden state 预测
     adapter_hidden = model.adapter_model(inputs_embeds=early_hidden)  # [1, L, D]
 
-    # LM head 映射到 vocab
-    full_logits    = model.head_model(final_hidden.float())    # [1, L, V]
-    adapter_logits = model.head_model(adapter_hidden.float())  # [1, L, V]
+    # LM head 映射到 vocab（用 head 自身的 dtype 做矩阵乘，再转 float32 算 softmax）
+    head_dtype = next(model.head_model.parameters()).dtype
+    full_logits    = model.head_model(final_hidden.to(head_dtype)).float()    # [1, L, V]
+    adapter_logits = model.head_model(adapter_hidden.to(head_dtype)).float()  # [1, L, V]
 
     # 取 assistant token 对应的预测位置：
     #   hidden_state[i] 预测 token[i+1]
