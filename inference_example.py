@@ -21,6 +21,7 @@ import json
 import time
 from tkinter import N
 import torch
+import torch.nn.functional as F
 from transformers import AutoProcessor
 
 from kangaroo_model import KangarooQwenModel
@@ -79,6 +80,126 @@ def warmup_model(model, processor, conversation, args, device):
     print("  Warmup done.\n")
 
 
+@torch.no_grad()
+def evaluate_adapter_quality(model, processor, conversation, reference_answer, args, device):
+    """
+    评估 adapter 用第 exit_layer 层 hidden state 模仿完整大模型输出分布的能力。
+    在 (prompt + reference_answer) 的 assistant token 位置上对比:
+      - 完整大模型的预测分布
+      - adapter 的预测分布
+    """
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+
+    # 构造完整对话（含 reference answer）与仅 context 部分
+    if isinstance(reference_answer, list):
+        asst_turn = {"role": "assistant", "content": reference_answer}
+    else:
+        asst_turn = {"role": "assistant", "content": [{"type": "text", "text": reference_answer}]}
+    full_conversation = list(conversation) + [asst_turn]
+
+    context_text = processor.apply_chat_template(
+        conversation, tokenize=False, add_generation_prompt=True
+    )
+    full_text = processor.apply_chat_template(
+        full_conversation, tokenize=False, add_generation_prompt=False
+    )
+
+    image_inputs, video_inputs = process_vision_info(full_conversation)
+
+    full_inputs = processor(
+        text=[full_text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    ).to(device)
+    context_inputs = processor(
+        text=[context_text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    ).to(device)
+
+    context_len = context_inputs['input_ids'].shape[1]
+    full_len = full_inputs['input_ids'].shape[1]
+    n_asst_tokens = full_len - context_len
+
+    if n_asst_tokens <= 0:
+        print("  [Adapter Eval] 没有 assistant token 可以评估。")
+        return
+
+    # 完整前向传播（含所有层 hidden states）
+    forward_kwargs = {k: v for k, v in {
+        'input_ids':           full_inputs['input_ids'],
+        'attention_mask':      full_inputs.get('attention_mask'),
+        'pixel_values':        full_inputs.get('pixel_values'),
+        'pixel_values_videos': full_inputs.get('pixel_values_videos'),
+        'image_grid_thw':      full_inputs.get('image_grid_thw'),
+        'video_grid_thw':      full_inputs.get('video_grid_thw'),
+        'second_per_grid_ts':  full_inputs.get('second_per_grid_ts'),
+        'output_hidden_states': True,
+        'return_dict':          True,
+        'use_cache':            False,
+        'drop_method':          'none',
+        'drop_threshold':       1.0,
+        'drop_absolute':        True,
+    }.items() if v is not None}
+
+    output = model.base_model.model(**forward_kwargs)
+
+    early_hidden = output.hidden_states[args.exit_layer]  # [1, L, D]
+    final_hidden  = output.hidden_states[-1]               # [1, L, D]
+
+    # Adapter 用 early hidden state 预测
+    adapter_hidden = model.adapter_model(inputs_embeds=early_hidden)  # [1, L, D]
+
+    # LM head 映射到 vocab
+    full_logits    = model.head_model(final_hidden.float())    # [1, L, V]
+    adapter_logits = model.head_model(adapter_hidden.float())  # [1, L, V]
+
+    # 取 assistant token 对应的预测位置：
+    #   hidden_state[i] 预测 token[i+1]
+    #   → 预测 token[context_len..full_len-1] 用位置 context_len-1..full_len-2
+    eval_slice = slice(context_len - 1, full_len - 1)
+    full_logits_e    = full_logits[0, eval_slice, :]    # [N, V]
+    adapter_logits_e = adapter_logits[0, eval_slice, :] # [N, V]
+    target_ids       = full_inputs['input_ids'][0, context_len:full_len]  # [N]
+
+    full_p     = F.softmax(full_logits_e,    dim=-1)
+    adapter_p  = F.softmax(adapter_logits_e, dim=-1)
+    adapter_lp = F.log_softmax(adapter_logits_e, dim=-1)
+
+    full_argmax    = full_logits_e.argmax(dim=-1)
+    adapter_argmax = adapter_logits_e.argmax(dim=-1)
+
+    argmax_match   = (full_argmax == adapter_argmax)
+    top1_acc       = argmax_match.float().mean().item()
+    accept_prob    = torch.min(full_p, adapter_p).sum(dim=-1)         # [N]
+    avg_accept     = accept_prob.mean().item()
+    kl_div         = (full_p * (full_p.clamp(min=1e-9).log() - adapter_lp)).sum(dim=-1)  # [N]
+    avg_kl         = kl_div.mean().item()
+    full_conf      = full_p.max(dim=-1).values
+    adapter_conf   = adapter_p.max(dim=-1).values
+    N = full_argmax.shape[0]
+
+    print(f"\n{'='*70}")
+    print(f"ADAPTER 质量评估  (exit_layer={args.exit_layer},  评估 token 数={N})")
+    print(f"{'='*70}")
+    print(f"  Top-1 准确率  (adapter argmax == full model argmax) : {top1_acc*100:.1f}%")
+    print(f"  平均接受概率  Σmin(p_full, p_adapter)               : {avg_accept:.4f}")
+    print(f"  平均 KL 散度  KL(full || adapter)                   : {avg_kl:.4f}")
+    print(f"  Full model 平均置信度                               : {full_conf.mean().item():.4f}")
+    print(f"  Adapter    平均置信度                               : {adapter_conf.mean().item():.4f}")
+
+    print(f"\n  {'步':>4}  {'实际token':>14}  {'Full预测':>14}  {'Adapter预测':>14}  "
+          f"{'匹配':>4}  {'Full置信':>8}  {'Adapt置信':>9}  {'接受率':>6}  {'KL':>6}")
+    print(f"  {'─'*90}")
+    for i in range(N):
+        actual  = repr(tokenizer.decode([target_ids[i].item()],  skip_special_tokens=False))
+        full_t  = repr(tokenizer.decode([full_argmax[i].item()], skip_special_tokens=False))
+        adapt_t = repr(tokenizer.decode([adapter_argmax[i].item()], skip_special_tokens=False))
+        match   = "✓" if argmax_match[i].item() else "❌"
+        print(f"  {i+1:>4}  {actual:>14}  {full_t:>14}  {adapt_t:>14}  {match:>4}  "
+              f"{full_conf[i].item():>8.3f}  {adapter_conf[i].item():>9.3f}  "
+              f"{accept_prob[i].item():>6.3f}  {kl_div[i].item():>6.3f}")
+    print(f"{'='*70}\n")
+
+
 def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     """Run speculative + AR on one conversation sample and print comparison."""
     print(f"\n{'='*70}")
@@ -113,6 +234,10 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
 
     inputs = build_inputs_from_conversation(processor, gen_conversation, device)
     # print(f"  Input tokens: {inputs['input_ids'].shape[1]}")
+
+    # ========== Adapter 质量评估 ==========
+    if reference_answer is not None and getattr(args, 'eval_adapter', False):
+        evaluate_adapter_quality(model, processor, gen_conversation, reference_answer, args, device)
 
     verify_mode = args.verify_mode
     block_verify = (verify_mode == 'fast_length')
@@ -253,6 +378,8 @@ def main():
     group.add_argument('--prompt', type=str, default=None,
                        help='Single text prompt (no image)')
 
+    parser.add_argument('--eval_adapter', default=False, action='store_true',
+                        help='在 inference 前评估 adapter 模仿完整大模型的能力（需要 reference answer）')
     parser.add_argument('--verify_mode', type=str, default='strict', choices=['strict', 'fast_length'],
                         help='strict: lossless sequential verify; fast_length: block verify for faster approximate decoding with length match metric')
     parser.add_argument('--sample_idx', type=int, default=1,
