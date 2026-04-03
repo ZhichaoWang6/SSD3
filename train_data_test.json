@@ -1,0 +1,152 @@
+[
+  {
+    "conversation": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000001.jpg"
+          },
+          {
+            "type": "text",
+            "text": "请描述这张图片中发生了什么？"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "图片中展示了一个第一人称视角的场景，可以看到人物正在进行某项活动。"
+      }
+    ]
+  },
+  {
+    "conversation": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000001.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000003.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000005.jpg"
+          },
+          {
+            "type": "text",
+            "text": "观察这几帧画面，描述人物的动作变化。"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "从这几帧连续画面来看，人物的动作发生了一定变化，整体呈现出连贯的行为序列。"
+      }
+    ]
+  },
+  {
+    "conversation": [
+      {
+        "role": "system",
+        "content": "你是一个视频理解助手，擅长分析第一人称视角（egocentric）视频内容。"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000001.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000003.jpg"
+          },
+          {
+            "type": "text",
+            "text": "这段视频片段中，人物接下来可能会做什么？"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "根据当前画面中人物的姿态和所处环境，预测接下来可能会继续当前任务或转向下一个操作步骤。"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000005.jpg"
+          },
+          {
+            "type": "text",
+            "text": "现在你看到了下一帧，你的预测准确吗？"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "对比新的一帧画面，可以验证之前的预测是否正确，并进一步分析行为的连续性。"
+      }
+    ]
+  },
+  {
+    "conversation": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000001.jpg"
+          },
+          {
+            "type": "text",
+            "text": "图中是否有人在使用工具？如果有，是什么工具？"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "从第一人称视角观察，画面中可以看到人物手部区域，需要进一步分析是否持有工具。"
+      }
+    ]
+  },
+  {
+    "conversation": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000001.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000003.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000005.jpg"
+          },
+          {
+            "type": "image",
+            "image": "/data/wangzhichao/benchmarks/ProactiveVideoQA/EGO/frames/0a01978c-e16d-4587-95f1-49efa3ab15d9-0-360/000007.jpg"
+          },
+          {
+            "type": "text",
+            "text": "这段视频发生在什么场景下？室内还是室外？"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "根据多帧画面的环境特征（光线、背景、地面等），可以判断这段视频拍摄于室内或室外环境。"
+      }
+    ]
+  }
+]
