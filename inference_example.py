@@ -153,9 +153,11 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
     warmup_inputs = _build_streaming_inputs(processor, history_warmup, device)
     reset()
     autoregressive_generate_direct(model=model, inputs=warmup_inputs, processor=processor, max_new_tokens=4)
+    # max_new_tokens 必须 > speculative_steps，否则 verify 会越界写 global_tokens
+    warmup_new_tokens = max(8, args.speculative_steps + 2)
     reset()
     kangaroo_speculative_generate(model=model, inputs=warmup_inputs, processor=processor,
-                                  max_new_tokens=4, early_exit_layer=args.exit_layer,
+                                  max_new_tokens=warmup_new_tokens, early_exit_layer=args.exit_layer,
                                   speculative_steps=args.speculative_steps,
                                   threshold=args.threshold, block_verify=block_verify)
     reset()
@@ -447,9 +449,10 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     if hasattr(model.base_model.model, 'rope_deltas'):
         model.base_model.model.rope_deltas = None
 
+    warmup_new_tokens = max(8, args.speculative_steps + 2)
     kangaroo_speculative_generate(
         model=model, inputs=inputs, processor=processor,
-        max_new_tokens=4, early_exit_layer=args.exit_layer,
+        max_new_tokens=warmup_new_tokens, early_exit_layer=args.exit_layer,
         speculative_steps=args.speculative_steps, threshold=args.threshold,
         block_verify=block_verify,
     )
