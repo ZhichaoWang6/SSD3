@@ -184,7 +184,7 @@ def main():
     parser.add_argument('--speculative_steps', type=int, default=6)
     parser.add_argument('--threshold', type=float, default=0.6)
     parser.add_argument('--max_new_tokens', type=int, default=512)
-    parser.add_argument('--device', type=str, default='cuda:3')
+    parser.add_argument('--device', type=str, default='cuda:6')
     parser.add_argument('--data_path', type=str, default="/data/wangzhichao/projects/SSD/train_data_test.json")
     parser.add_argument('--sample_idx', type=int, default=1)
     parser.add_argument('--num_samples', type=int, default=3)
