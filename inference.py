@@ -45,7 +45,6 @@ class ProactiveTestArguments(TrainingArguments):
     speculative_threshold: float = 0.6
     speculative_steps: int = 6
     num_adapter_layers: int = 1
-    verify_mode: str = 'strict'  # 'strict' = lossless sequential verify, 'fast' = block verify
 
 
 def get_args():
@@ -74,7 +73,6 @@ class ProactiveInferenceClient:
             self.speculative_threshold = args.speculative_threshold
             self.speculative_steps = args.speculative_steps
             self.exit_layer = args.exit_layer
-            self.verify_mode = getattr(args, 'verify_mode', 'strict')
         else:
             self.kangaroo_model = None
             self.model = model if model is not None else Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -153,17 +151,15 @@ class ProactiveInferenceClient:
                 elif isinstance(input, (list, tuple)):
                     num_frames += self._recursive_stat_num_frames(input)
         return num_frames
-            
-    def _encode_query(self, debug_print=False):
+
+    def _encode_query(self):
         newly_added_turns = list()
         while True:
             query = self.query_queue.popleft()
             self.history.append(query)
             newly_added_turns.append(query)
-            # we don't need reply after system prompt, or the test data clearly specified that we do not need to reply now
             if query['role'] in ['system', 'assistant'] or query.get('skip_inference', False):
                 pass
-            # otherwise, we need to break the data loading loop, let the model encode the conversation turns loaded and start to generate replies
             else:
                 break
 
@@ -171,18 +167,9 @@ class ProactiveInferenceClient:
             self.history, tokenize=False, add_generation_prompt=True,
         )
 
-        # Check if the last turn in the newly added turns explicitly requires a reply
         if query.get('must_reply', False):
             text += self.must_reply_prompt
 
-        if debug_print:
-            print("DEBUG text before generate:", text)
-
-        # Theoretically, the most standard approach should be:
-        # image_inputs, video_inputs = process_vision_info(self.history)
-        # This ensures that the loaded image_inputs, video_inputs correspond to the image placeholders in the text.
-        # However, the images and videos from previous turns have already been loaded before, so in this round we only need to load the latest turn's images and videos and merge them with the previous ones.
-        # In fact, the images and videos from previous rounds won't be used in this round's generate... because they have already been encoded by the LLM and placed in the KVCache. But to avoid errors, we still need to ensure that the images and videos from previous rounds are passed in, at least formally.
         new_image_inputs, new_video_inputs = process_vision_info(newly_added_turns)
         if new_image_inputs is not None:
             self.prev_image_inputs.extend(new_image_inputs)
@@ -206,7 +193,6 @@ class ProactiveInferenceClient:
 
         if self.model.model.all_keep_masks:
             assert inputs.input_ids.size(0) == 1, "token drop in inference only support batch size 1 now"
-            # Drop the visual tokens that were already dropped in previous rounds in the current input_ids as well
             keep_mask = torch.ones_like(inputs.input_ids, dtype=torch.bool)
             old_keep_mask = torch.cat(self.model.model.all_keep_masks, dim=1)
             keep_mask[:, :old_keep_mask.size(1)] = old_keep_mask
@@ -224,16 +210,9 @@ class ProactiveInferenceClient:
                 early_exit_layer=self.exit_layer,
                 speculative_steps=self.speculative_steps,
                 threshold=self.speculative_threshold,
-                block_verify=(self.verify_mode == 'fast'),
             )
 
             combined_stats = {'speculative': spec_stats}
-            if debug_print:
-                print(f"[Speculative] avg_accept={spec_stats['avg_accept_length']:.2f}, "
-                      f"rounds={spec_stats['total_rounds']}, tokens={spec_stats['total_tokens']}, "
-                      f"tok/s={spec_stats['tokens_per_second']:.1f}, "
-                      f"decode_tok/s={spec_stats['decode_tokens_per_second']:.1f}, "
-                      f"total={spec_stats['total_time']:.3f}s")
 
             # ---- Also run autoregressive baseline for comparison ----
             if self.compare_with_baseline:
@@ -257,14 +236,11 @@ class ProactiveInferenceClient:
                 combined_stats['speedup_ratio'] = speedup_total
                 combined_stats['speedup_decode'] = speedup_decode
 
-                if debug_print or not output_match:
-                    tag = "MATCH" if output_match else "MISMATCH"
-                    print(f"[AR Baseline] tokens={ar_tokens}, tok/s={ar_stats['tokens_per_second']:.1f}, time={ar_stats['total_time']:.3f}s")
-                    print(f"[Compare] [{tag}] spec_tokens={spec_tokens}, ar_tokens={ar_tokens}, "
-                          f"length_match={length_match}, speedup(total)={speedup_total:.2f}x, speedup(decode)={speedup_decode:.2f}x")
-                    if not output_match:
-                        print(f"  Spec output: {repr(reply_text[:200])}")
-                        print(f"  AR   output: {repr(ar_text[:200])}")
+                if not output_match:
+                    print(f"[Compare] [MISMATCH] spec_tokens={spec_tokens}, ar_tokens={ar_tokens}, "
+                          f"length_match={length_match}, speedup(total)={speedup_total:.2f}x")
+                    print(f"  Spec output: {repr(reply_text[:200])}")
+                    print(f"  AR   output: {repr(ar_text[:200])}")
 
                 # Restore kangaroo model state for next speculative turn
                 self.kangaroo_model.base_model.past_key_values = self.past_key_values
@@ -280,7 +256,7 @@ class ProactiveInferenceClient:
                 max_new_tokens=512,
                 past_key_values=self.past_key_values,
                 return_dict_in_generate=True,
-                drop_method='none', drop_threshold=1.0, drop_absolute=True,      # no dropping
+                drop_method='none', drop_threshold=1.0, drop_absolute=True,
                 do_sample=self.do_sample, temperature=self.temperature, top_k=self.top_k
             )
 
@@ -301,20 +277,14 @@ class ProactiveInferenceClient:
                 },
             }
             self.generation_stats.append(baseline_stats)
-            if debug_print:
-                print(f"[AR] tokens={num_new_tokens}, "
-                      f"tok/s={baseline_stats['autoregressive']['tokens_per_second']:.1f}, "
-                      f"time={gen_time:.3f}s")
+
         if query.get('must_reply', False):
             reply_text = self.must_reply_prompt + reply_text
         self.history.append({'role': 'assistant', 'content': reply_text, 'time': self.video_time})
 
-        if debug_print: 
-            print("kvcache length now:", self.past_key_values.get_seq_length())
-
-    def inference(self, debug_print=False):
+    def inference(self):
         while self.query_queue:
-            self._encode_query(debug_print=debug_print)
+            self._encode_query()
         return {
             'conversation': copy.deepcopy(self.history),
             'drop_ratio': copy.deepcopy(self.model.model.all_drop_ratios),
@@ -324,7 +294,6 @@ class ProactiveInferenceClient:
 
 class DoNothingDataCollator:
     def __call__(self, batch):
-        # Since batch size is 1, just return the first (and only) element
         return batch[0]
 
 
@@ -340,7 +309,6 @@ def round_numbers(data, n):
 
 def post_process_conversation_for_print(conversation):
     no_reply_text= "NO REPLY"
-    # remove images from user turns
     new_conversation = list()
     for turn in conversation:
         if isinstance(turn['content'], list):
@@ -359,6 +327,7 @@ def post_process_conversation_for_print(conversation):
 
 
 def main():
+    all_stats = []
     args = get_args()
     print(args)
     data_list = json.load(open(args.test_fname))
@@ -395,93 +364,36 @@ def main():
         if example_i >= args.end_idx: break
         wrapper.reset()
         wrapper.input_query_stream(example['conversation'])
-        model_outputs = wrapper.inference(debug_print=(example_i - args.start_idx) < 2)
+        model_outputs = wrapper.inference()
         res = {
             'question_id': example['question_id'],
-            # 'model_response_list': [turn for turn in model_outputs['conversation'] if turn['role'] == 'assistant'],
-            'model_response_list': post_process_conversation_for_print(model_outputs['conversation']),   # keep the user turns for easier human inspection of data quality
+            'model_response_list': post_process_conversation_for_print(model_outputs['conversation']),
             'drop_ratio_list': model_outputs['drop_ratio'],
             'generation_stats': model_outputs['generation_stats'],
         }
         f_out.write(json.dumps(res) + '\n')
         f_out.flush()
 
-        # Collect per-example speed stats
         for s in model_outputs['generation_stats']:
             all_stats.append(s)
 
     f_out.close()
 
-    # Print aggregate speed metrics
     if all_stats:
-        print("\n" + "=" * 60)
-        print(f"Aggregate Speed Metrics ({len(all_stats)} generations)")
-        print("=" * 60)
-
-        # Autoregressive stats (always present)
-        ar_stats_list = [s['autoregressive'] for s in all_stats if 'autoregressive' in s]
-        if ar_stats_list:
-            ar_total_tokens = sum(s['total_tokens'] for s in ar_stats_list)
-            ar_total_time = sum(s['total_time'] for s in ar_stats_list)
-            ar_tok_s = ar_total_tokens / ar_total_time if ar_total_time > 0 else 0
-            print(f"[Autoregressive]")
-            print(f"  Total tokens:    {ar_total_tokens}")
-            print(f"  Total time:      {ar_total_time:.2f}s")
-            print(f"  Tokens/sec:      {ar_tok_s:.1f}")
-
-        # Speculative stats
         spec_stats_list = [s['speculative'] for s in all_stats if 'speculative' in s]
-        if spec_stats_list:
-            spec_total_tokens = sum(s['total_tokens'] for s in spec_stats_list)
-            spec_total_time = sum(s['total_time'] for s in spec_stats_list)
-            spec_tok_s = spec_total_tokens / spec_total_time if spec_total_time > 0 else 0
-            accept_lengths = []
-            total_decode_time = 0
-            for s in spec_stats_list:
-                accept_lengths.extend(s.get('accept_lengths', []))
-                total_decode_time += s.get('decode_time', 0)
-            decode_tok_s = spec_total_tokens / total_decode_time if total_decode_time > 0 else 0
-            avg_accept = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0
+        ar_stats_list = [s['autoregressive'] for s in all_stats if 'autoregressive' in s]
+        speedup_ratios = [s['speedup_ratio'] for s in all_stats if 'speedup_ratio' in s]
+        matches = [s['output_match'] for s in all_stats if 'output_match' in s]
 
-            print(f"[Speculative Decoding]")
-            print(f"  Total tokens:    {spec_total_tokens}")
-            print(f"  Total time:      {spec_total_time:.2f}s")
-            print(f"  Tokens/sec:      {spec_tok_s:.1f}")
-            print(f"  Decode tok/s:    {decode_tok_s:.1f}")
-            print(f"  Avg accept len:  {avg_accept:.2f}")
-            print(f"  Total rounds:    {sum(s['total_rounds'] for s in spec_stats_list)}")
-
-        # Comparison (when both are available)
-        if ar_stats_list and spec_stats_list:
-            speedup_ratios = [s['speedup_ratio'] for s in all_stats if 'speedup_ratio' in s]
-            speedup_decode_ratios = [s['speedup_decode'] for s in all_stats if 'speedup_decode' in s]
-            matches = [s['output_match'] for s in all_stats if 'output_match' in s]
-            length_matches = [s['length_match'] for s in all_stats if 'length_match' in s]
-            avg_speedup = sum(speedup_ratios) / len(speedup_ratios) if speedup_ratios else 0
-            avg_speedup_decode = sum(speedup_decode_ratios) / len(speedup_decode_ratios) if speedup_decode_ratios else 0
+        if speedup_ratios:
+            overall_speedup = (sum(s['total_time'] for s in ar_stats_list) /
+                               sum(s['total_time'] for s in spec_stats_list))
             match_rate = sum(matches) / len(matches) if matches else 0
-            length_match_rate = sum(length_matches) / len(length_matches) if length_matches else 0
-            overall_speedup = ar_total_time / spec_total_time if spec_total_time > 0 else 0
-
-            # Decode-only overall speedup
-            ar_total_decode = sum(s.get('decode_time', s['total_time']) for s in ar_stats_list)
-            spec_total_decode = sum(s.get('decode_time', s['total_time']) for s in spec_stats_list)
-            overall_decode_speedup = ar_total_decode / spec_total_decode if spec_total_decode > 0 else 0
-
-            print(f"[Comparison]")
-            print(f"  Verify mode:             {wrapper.verify_mode}")
-            print(f"  Overall speedup (total):  {overall_speedup:.2f}x")
-            print(f"  Overall speedup (decode): {overall_decode_speedup:.2f}x")
-            print(f"  Avg per-turn speedup (total):  {avg_speedup:.2f}x")
-            print(f"  Avg per-turn speedup (decode): {avg_speedup_decode:.2f}x")
-            print(f"  Output match rate:    {match_rate:.1%} ({sum(matches)}/{len(matches)})")
-            print(f"  Length match rate:    {length_match_rate:.1%} ({sum(length_matches)}/{len(length_matches)})")
-            if match_rate < 1.0:
-                num_mismatch = len(matches) - sum(matches)
-                print(f"  WARNING: {num_mismatch} output(s) differ between AR and speculative!")
-        print("=" * 60)
+            avg_accept = sum(s['avg_accept_length'] for s in spec_stats_list) / len(spec_stats_list)
+            print(f"\nOverall speedup: {overall_speedup:.2f}x  "
+                  f"match rate: {match_rate:.1%}  "
+                  f"avg accept len: {avg_accept:.2f}")
 
 
 if __name__ == '__main__':
-    all_stats = []
     main()

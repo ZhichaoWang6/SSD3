@@ -12,14 +12,13 @@ Usage:
     # Json file, run specific sample
     python inference_example.py --data_path ./data.json --sample_idx 0
 
-    # Json file, run first N samples, show draft/verify details
-    python inference_example.py --data_path ./data.json --num_samples 3 --verbose
+    # Json file, streaming mode (turn-by-turn with KV cache reuse)
+    python inference_example.py --data_path ./data.json --streaming
 """
 
 import argparse
 import json
 import time
-from tkinter import N
 import torch
 import torch.nn.functional as F
 from transformers import AutoProcessor
@@ -35,7 +34,6 @@ def build_inputs_from_conversation(processor, conversation, device):
     text = processor.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=True
     )
-    # print(f"Processed conversation text:\n{text}\n")
     image_inputs, video_inputs = process_vision_info(conversation)
     inputs = processor(
         text=[text],
@@ -45,40 +43,6 @@ def build_inputs_from_conversation(processor, conversation, device):
         return_tensors="pt",
     )
     return inputs.to(device)
-
-
-def warmup_model(model, processor, conversation, args, device):
-    """Run one short forward pass to warm up CUDA kernels and memory allocators."""
-    print("  Warming up CUDA kernels...")
-    inputs = build_inputs_from_conversation(processor, conversation, device)
-
-    # Warmup spec path
-    kangaroo_speculative_generate(
-        model=model, inputs=inputs, processor=processor,
-        max_new_tokens=8, early_exit_layer=args.exit_layer,
-        speculative_steps=args.speculative_steps, threshold=args.threshold,
-        block_verify=False,
-    )
-
-    # Reset state
-    model.base_model.past_key_values = None
-    model.reset_status()
-    if hasattr(model.base_model.model, 'rope_deltas'):
-        model.base_model.model.rope_deltas = None
-
-    # Warmup AR path
-    autoregressive_generate_direct(
-        model=model, inputs=inputs, processor=processor, max_new_tokens=8,
-    )
-
-    # Reset state
-    model.base_model.past_key_values = None
-    model.reset_status()
-    if hasattr(model.base_model.model, 'rope_deltas'):
-        model.base_model.model.rope_deltas = None
-
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    print("  Warmup done.\n")
 
 
 def _build_streaming_inputs(processor, history, device):
@@ -99,18 +63,17 @@ def _build_streaming_inputs(processor, history, device):
 
 def run_one_sample_streaming(model, processor, conversation, args, device, sample_idx=0):
     """
-    流式模式：逐轮处理对话，每个 user turn 独立生成一次回复，KV cache 跨轮复用。
-    更贴近 inference.py 中 ProactiveInferenceClient 的真实推理场景。
+    Streaming mode: process conversation turn-by-turn with KV cache reuse.
+    Mirrors the ProactiveInferenceClient pattern in inference.py.
     """
-    block_verify = (args.verify_mode == 'fast_length')
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
 
     print(f"\n{'='*70}")
-    print(f"Sample {sample_idx}  [流式模式]")
+    print(f"Sample {sample_idx}  [Streaming]")
     print(f"{'='*70}")
 
-    # 解析对话：提取所有轮次
-    turns = []   # list of (user_turn, reference_asst_turn_or_None)
+    # Parse turns
+    turns = []
     i = 0
     while i < len(conversation):
         turn = conversation[i]
@@ -129,10 +92,9 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
             i += 1
 
     if not turns:
-        print("  没有找到 user turn，跳过。")
+        print("  No user turns found, skipping.")
         return {}
 
-    # 初始化状态
     history = []
     if conversation[0]['role'] == 'system':
         history.append(conversation[0])
@@ -140,29 +102,25 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
     spec_past_kv = None
     ar_past_kv   = None
 
-    # 重置模型状态
     def reset():
         model.base_model.past_key_values = None
         model.reset_status()
         if hasattr(model.base_model.model, 'rope_deltas'):
             model.base_model.model.rope_deltas = None
 
-    # Warmup（用第一个 user turn）
-    print(f"  Warmup...")
+    # Warmup with first user turn
     history_warmup = list(history) + [turns[0][0]]
     warmup_inputs = _build_streaming_inputs(processor, history_warmup, device)
     reset()
     autoregressive_generate_direct(model=model, inputs=warmup_inputs, processor=processor, max_new_tokens=4)
-    # max_new_tokens 必须 > speculative_steps，否则 verify 会越界写 global_tokens
     warmup_new_tokens = max(8, args.speculative_steps + 2)
     reset()
     kangaroo_speculative_generate(model=model, inputs=warmup_inputs, processor=processor,
                                   max_new_tokens=warmup_new_tokens, early_exit_layer=args.exit_layer,
                                   speculative_steps=args.speculative_steps,
-                                  threshold=args.threshold, block_verify=block_verify)
+                                  threshold=args.threshold)
     reset()
     torch.cuda.synchronize() if torch.cuda.is_available() else None
-    print(f"  Warmup done.\n")
 
     all_spec_stats = []
     all_ar_stats   = []
@@ -172,7 +130,6 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
         history.append(user_turn)
         inputs = _build_streaming_inputs(processor, history, device)
 
-        # 打印当前轮摘要
         content = user_turn['content']
         if isinstance(content, list):
             texts  = [c['text'] for c in content if c.get('type') == 'text']
@@ -188,7 +145,7 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
             ref_text = rc if isinstance(rc, str) else ' '.join(b['text'] for b in rc if b.get('type') == 'text')
 
         print(f"{'─'*70}")
-        print(f"【Turn {turn_idx+1}/{len(turns)}】  input tokens={inputs['input_ids'].shape[1]}")
+        print(f"[Turn {turn_idx+1}/{len(turns)}]  input tokens={inputs['input_ids'].shape[1]}")
         print(f"  [user] {text_s}{media}")
         if ref_text:
             print(f"  [ref ] {ref_text}")
@@ -203,9 +160,7 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
             early_exit_layer=args.exit_layer,
             speculative_steps=args.speculative_steps,
             threshold=args.threshold,
-            block_verify=block_verify,
         )
-        # 将 spec 的 KV cache 同步到 base_model（speculative_generate_for_streaming 已更新）
         spec_past_kv = model.base_model.past_key_values
 
         # ---- AR baseline ----
@@ -220,7 +175,7 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
         )
         ar_past_kv = ar_past_kv_new
 
-        # 恢复 base_model 的 spec KV cache（下一轮 spec 需要）
+        # Restore spec KV cache for next round
         model.base_model.past_key_values = spec_past_kv
         model.reset_status()
 
@@ -234,17 +189,16 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
 
         print(f"  [Spec] {spec_reply}")
         print(f"  [AR  ] {ar_reply}")
-        print(f"  {'✓ MATCH' if match else '❌ MISMATCH'}  "
+        print(f"  {'MATCH' if match else 'MISMATCH'}  "
               f"accept_len={spec_stats['avg_accept_length']:.2f}  "
               f"speedup(total)={speedup_total:.2f}x  speedup(decode)={speedup_decode:.2f}x  "
               f"spec={spec_stats['total_time']*1000:.0f}ms  ar={ar_stats['total_time']*1000:.0f}ms")
 
-        # 把 spec 的回复加入 history（用于下一轮 context）
         history.append({'role': 'assistant', 'content': spec_reply})
 
-    # ---- 汇总 ----
+    # Summary
     print(f"\n{'='*70}")
-    print(f"流式汇总  ({len(turns)} turns)")
+    print(f"Streaming summary  ({len(turns)} turns)")
     print(f"{'='*70}")
     match_rate  = sum(all_matches) / len(all_matches)
     avg_accept  = sum(s['avg_accept_length'] for s in all_spec_stats) / len(all_spec_stats)
@@ -273,14 +227,11 @@ def run_one_sample_streaming(model, processor, conversation, args, device, sampl
 @torch.no_grad()
 def evaluate_adapter_quality(model, processor, conversation, reference_answer, args, device):
     """
-    评估 adapter 用第 exit_layer 层 hidden state 模仿完整大模型输出分布的能力。
-    在 (prompt + reference_answer) 的 assistant token 位置上对比:
-      - 完整大模型的预测分布
-      - adapter 的预测分布
+    Evaluate how well the adapter (using exit_layer hidden states) approximates
+    the full model's output distribution on assistant tokens.
     """
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
 
-    # 构造完整对话（含 reference answer）与仅 context 部分
     if isinstance(reference_answer, list):
         asst_turn = {"role": "assistant", "content": reference_answer}
     else:
@@ -310,10 +261,9 @@ def evaluate_adapter_quality(model, processor, conversation, reference_answer, a
     n_asst_tokens = full_len - context_len
 
     if n_asst_tokens <= 0:
-        print("  [Adapter Eval] 没有 assistant token 可以评估。")
+        print("  [Adapter Eval] No assistant tokens to evaluate.")
         return
 
-    # 完整前向传播（含所有层 hidden states）
     forward_kwargs = {k: v for k, v in {
         'input_ids':           full_inputs['input_ids'],
         'attention_mask':      full_inputs.get('attention_mask'),
@@ -332,24 +282,19 @@ def evaluate_adapter_quality(model, processor, conversation, reference_answer, a
 
     output = model.base_model.model(**forward_kwargs)
 
-    early_hidden = output.hidden_states[args.exit_layer]  # [1, L, D]
-    final_hidden  = output.hidden_states[-1]               # [1, L, D]
+    early_hidden = output.hidden_states[args.exit_layer]
+    final_hidden  = output.hidden_states[-1]
 
-    # Adapter 用 early hidden state 预测
-    adapter_hidden = model.adapter_model(inputs_embeds=early_hidden)  # [1, L, D]
+    adapter_hidden = model.adapter_model(inputs_embeds=early_hidden)
 
-    # LM head 映射到 vocab（用 head 自身的 dtype 做矩阵乘，再转 float32 算 softmax）
     head_dtype = next(model.head_model.parameters()).dtype
-    full_logits    = model.head_model(final_hidden.to(head_dtype)).float()    # [1, L, V]
-    adapter_logits = model.head_model(adapter_hidden.to(head_dtype)).float()  # [1, L, V]
+    full_logits    = model.head_model(final_hidden.to(head_dtype)).float()
+    adapter_logits = model.head_model(adapter_hidden.to(head_dtype)).float()
 
-    # 取 assistant token 对应的预测位置：
-    #   hidden_state[i] 预测 token[i+1]
-    #   → 预测 token[context_len..full_len-1] 用位置 context_len-1..full_len-2
     eval_slice = slice(context_len - 1, full_len - 1)
-    full_logits_e    = full_logits[0, eval_slice, :]    # [N, V]
-    adapter_logits_e = adapter_logits[0, eval_slice, :] # [N, V]
-    target_ids       = full_inputs['input_ids'][0, context_len:full_len]  # [N]
+    full_logits_e    = full_logits[0, eval_slice, :]
+    adapter_logits_e = adapter_logits[0, eval_slice, :]
+    target_ids       = full_inputs['input_ids'][0, context_len:full_len]
 
     full_p     = F.softmax(full_logits_e,    dim=-1)
     adapter_p  = F.softmax(adapter_logits_e, dim=-1)
@@ -360,33 +305,33 @@ def evaluate_adapter_quality(model, processor, conversation, reference_answer, a
 
     argmax_match   = (full_argmax == adapter_argmax)
     top1_acc       = argmax_match.float().mean().item()
-    accept_prob    = torch.min(full_p, adapter_p).sum(dim=-1)         # [N]
+    accept_prob    = torch.min(full_p, adapter_p).sum(dim=-1)
     avg_accept     = accept_prob.mean().item()
-    kl_div         = (full_p * (full_p.clamp(min=1e-9).log() - adapter_lp)).sum(dim=-1)  # [N]
+    kl_div         = (full_p * (full_p.clamp(min=1e-9).log() - adapter_lp)).sum(dim=-1)
     avg_kl         = kl_div.mean().item()
     full_conf      = full_p.max(dim=-1).values
     adapter_conf   = adapter_p.max(dim=-1).values
     N = full_argmax.shape[0]
 
     print(f"\n{'='*70}")
-    print(f"ADAPTER 质量评估  (exit_layer={args.exit_layer},  评估 token 数={N})")
+    print(f"ADAPTER QUALITY  (exit_layer={args.exit_layer},  tokens={N})")
     print(f"{'='*70}")
-    print(f"  Top-1 准确率  (adapter argmax == full model argmax) : {top1_acc*100:.1f}%")
-    print(f"  平均接受概率  Σmin(p_full, p_adapter)               : {avg_accept:.4f}")
-    print(f"  平均 KL 散度  KL(full || adapter)                   : {avg_kl:.4f}")
-    print(f"  Full model 平均置信度                               : {full_conf.mean().item():.4f}")
-    print(f"  Adapter    平均置信度                               : {adapter_conf.mean().item():.4f}")
+    print(f"  Top-1 accuracy (adapter argmax == full model argmax): {top1_acc*100:.1f}%")
+    print(f"  Avg acceptance prob  Σmin(p_full, p_adapter):         {avg_accept:.4f}")
+    print(f"  Avg KL divergence    KL(full || adapter):             {avg_kl:.4f}")
+    print(f"  Full model avg confidence:                            {full_conf.mean().item():.4f}")
+    print(f"  Adapter    avg confidence:                            {adapter_conf.mean().item():.4f}")
 
-    print(f"\n  {'步':>4}  {'实际token':>14}  {'Full预测':>14}  {'Adapter预测':>14}  "
-          f"{'匹配':>4}  {'Full置信':>8}  {'Adapt置信':>9}  {'接受率':>6}  {'KL':>6}")
+    print(f"\n  {'#':>4}  {'actual':>14}  {'full pred':>14}  {'adapt pred':>14}  "
+          f"{'match':>5}  {'full conf':>9}  {'adapt conf':>10}  {'accept':>6}  {'KL':>6}")
     print(f"  {'─'*90}")
     for i in range(N):
         actual  = repr(tokenizer.decode([target_ids[i].item()],  skip_special_tokens=False))
         full_t  = repr(tokenizer.decode([full_argmax[i].item()], skip_special_tokens=False))
         adapt_t = repr(tokenizer.decode([adapter_argmax[i].item()], skip_special_tokens=False))
-        match   = "✓" if argmax_match[i].item() else "❌"
-        print(f"  {i+1:>4}  {actual:>14}  {full_t:>14}  {adapt_t:>14}  {match:>4}  "
-              f"{full_conf[i].item():>8.3f}  {adapter_conf[i].item():>9.3f}  "
+        match   = "Y" if argmax_match[i].item() else "N"
+        print(f"  {i+1:>4}  {actual:>14}  {full_t:>14}  {adapt_t:>14}  {match:>5}  "
+              f"{full_conf[i].item():>9.3f}  {adapter_conf[i].item():>10.3f}  "
               f"{accept_prob[i].item():>6.3f}  {kl_div[i].item():>6.3f}")
     print(f"{'='*70}\n")
 
@@ -397,7 +342,6 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     print(f"Sample {sample_idx}")
     print(f"{'='*70}")
 
-    # Print conversation summary
     for turn in conversation:
         role = turn['role']
         content = turn['content']
@@ -424,23 +368,17 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
         print(f"\n  [Reference] {reference_answer}")
 
     inputs = build_inputs_from_conversation(processor, gen_conversation, device)
-    # print(f"  Input tokens: {inputs['input_ids'].shape[1]}")
 
-    # ========== Adapter 质量评估 ==========
+    # ========== Adapter quality evaluation ==========
     if reference_answer is not None and getattr(args, 'eval_adapter', False):
         evaluate_adapter_quality(model, processor, gen_conversation, reference_answer, args, device)
 
-    verify_mode = args.verify_mode
-    block_verify = (verify_mode == 'fast_length')
-
     # ========== Warmup ==========
-    print(f"\n  Running warmup (short forward to warm CUDA kernels)...")
     model.base_model.past_key_values = None
     model.reset_status()
     if hasattr(model.base_model.model, 'rope_deltas'):
         model.base_model.model.rope_deltas = None
 
-    # Warmup AR first (so spec doesn't eat the cold-start cost)
     autoregressive_generate_direct(
         model=model, inputs=inputs, processor=processor, max_new_tokens=4,
     )
@@ -454,14 +392,12 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
         model=model, inputs=inputs, processor=processor,
         max_new_tokens=warmup_new_tokens, early_exit_layer=args.exit_layer,
         speculative_steps=args.speculative_steps, threshold=args.threshold,
-        block_verify=block_verify,
     )
     model.base_model.past_key_values = None
     model.reset_status()
     if hasattr(model.base_model.model, 'rope_deltas'):
         model.base_model.model.rope_deltas = None
     torch.cuda.synchronize() if torch.cuda.is_available() else None
-    print(f"  Warmup done.")
 
     # ========== Speculative Decoding ==========
     print(f"\n  Running speculative decoding...")
@@ -473,8 +409,6 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
         early_exit_layer=args.exit_layer,
         speculative_steps=args.speculative_steps,
         threshold=args.threshold,
-        verbose=args.verbose,
-        block_verify=block_verify,
     )
     spec_new_tokens = output_ids[:, inputs['input_ids'].shape[1]:]
     spec_reply = processor.batch_decode(spec_new_tokens, skip_special_tokens=True)[0]
@@ -495,7 +429,7 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     )
     ar_num_tokens = ar_stats['total_tokens']
 
-    # ========== Print Results ==========
+    # ========== Results ==========
     output_match = (spec_reply == ar_reply)
     length_match = (spec_num_tokens == ar_num_tokens)
     total_speedup = ar_stats['total_time'] / stats['total_time'] if stats['total_time'] > 0 else 0
@@ -507,9 +441,8 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     if reference_answer:
         print(f"  [Reference  ]  {reference_answer}")
     print(f"  {'─'*60}")
-    print(f"  Verify mode:       {verify_mode}")
-    print(f"  Output match:      {'✓ MATCH' if output_match else '❌ MISMATCH'}")
-    print(f"  Length match:      {'✓ MATCH' if length_match else '❌ MISMATCH'}")
+    print(f"  Output match:      {'MATCH' if output_match else 'MISMATCH'}")
+    print(f"  Length match:      {'MATCH' if length_match else 'MISMATCH'}")
     print(f"  Speedup (total):   {total_speedup:.2f}x")
     print(f"  Speedup (decode):  {decode_speedup:.2f}x")
     print(f"  Spec  tok/s:       {stats['tokens_per_second']:.1f}  "
@@ -524,10 +457,7 @@ def run_one_sample(model, processor, conversation, args, device, sample_idx=0):
     print(f"  Accept lengths:    {stats['accept_lengths']}")
 
     if not output_match:
-        if verify_mode == 'strict':
-            print(f"\n  ⚠ WARNING: outputs differ! Greedy decoding should be identical in strict mode.")
-        else:
-            print(f"\n  ⚠ WARNING: outputs differ in fast_length mode. This mode only targets similar length / faster decode.")
+        print(f"\n  WARNING: outputs differ.")
         print(f"    Spec: {repr(spec_reply[:200])}")
         print(f"    AR:   {repr(ar_reply[:200])}")
 
@@ -560,29 +490,19 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.6)
     parser.add_argument('--max_new_tokens', type=int, default=512)
     parser.add_argument('--device', type=str, default='cuda:3')
-    parser.add_argument('--verbose', default=True, action='store_true',
-                        help='Show draft/verify details for each round')
 
-    # Input source
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--data_path', type=str, default="/data/wangzhichao/projects/SSD/train_data_test.json",
-                       help='Path to json file with conversations')
-    group.add_argument('--prompt', type=str, default=None,
-                       help='Single text prompt (no image)')
+    group.add_argument('--data_path', type=str, default="/data/wangzhichao/projects/SSD/train_data_test.json")
+    group.add_argument('--prompt', type=str, default=None)
 
     parser.add_argument('--eval_adapter', default=False, action='store_true',
-                        help='在 inference 前评估 adapter 模仿完整大模型的能力（需要 reference answer）')
+                        help='Evaluate adapter quality against full model before inference')
     parser.add_argument('--streaming', default=False, action='store_true',
-                        help='流式模式：逐轮处理对话，KV cache 跨轮复用，贴近真实推理场景')
-    parser.add_argument('--verify_mode', type=str, default='strict', choices=['strict', 'fast_length'],
-                        help='strict: lossless sequential verify; fast_length: block verify for faster approximate decoding with length match metric')
-    parser.add_argument('--sample_idx', type=int, default=1,
-                        help='Run only this sample index (default: run all)')
-    parser.add_argument('--num_samples', type=int, default=3,
-                        help='Max number of samples to run')
+                        help='Streaming mode: process turns one-by-one with KV cache reuse')
+    parser.add_argument('--sample_idx', type=int, default=1)
+    parser.add_argument('--num_samples', type=int, default=3)
     args = parser.parse_args()
 
-    # Load model
     print(f"Loading model from {args.model_path}...")
     model = KangarooQwenModel(
         base_model_path=args.model_path,
@@ -593,7 +513,6 @@ def main():
     device = model.device
     processor = AutoProcessor.from_pretrained(args.model_path)
 
-    # ========== Json file input ==========
     if args.data_path is not None:
         with open(args.data_path, 'r') as f:
             data = json.load(f)
@@ -616,7 +535,6 @@ def main():
                 result = run_one_sample(model, processor, conversation, args, device, idx)
             all_results.append(result)
 
-        # Summary across all samples
         if len(all_results) > 1:
             print(f"\n{'='*70}")
             print(f"SUMMARY  ({len(all_results)} samples)")
@@ -628,7 +546,6 @@ def main():
             avg_accept = sum(r['avg_accept_length'] for r in all_results) / len(all_results)
             avg_spec_tps = sum(r['spec_decode_tps'] for r in all_results) / len(all_results)
             avg_ar_tps = sum(r['ar_decode_tps'] for r in all_results) / len(all_results)
-            print(f"  Verify mode:          {args.verify_mode}")
             print(f"  Output match:        {match_count}/{len(all_results)}")
             print(f"  Length match:        {length_match_count}/{len(all_results)}")
             print(f"  Avg speedup (total): {avg_speedup_total:.2f}x")
@@ -637,7 +554,6 @@ def main():
             print(f"  Avg spec decode tok/s: {avg_spec_tps:.1f}")
             print(f"  Avg AR   decode tok/s: {avg_ar_tps:.1f}")
 
-    # ========== Single prompt input ==========
     else:
         prompt = args.prompt or 'Hello, what can you do?'
         conversation = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
